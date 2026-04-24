@@ -2035,6 +2035,7 @@ mod tests {
         };
         let json2 = serde_json::to_string(&signer2).unwrap();
         assert!(json2.contains("pre_signed_xdr"));
+    }
 
     #[test]
     fn test_build_extend_ttl_suggestions_flags_low_ttl_entries() {
