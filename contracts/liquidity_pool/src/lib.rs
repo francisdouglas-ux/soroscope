@@ -170,32 +170,14 @@ pub const LOW_VOLATILITY_FEE_BPS: i128 = 40;
 pub const MEDIUM_VOLATILITY_FEE_BPS: i128 = 70;
 pub const HIGH_VOLATILITY_FEE_BPS: i128 = 100;
 
-// ── Oracle trait ──────────────────────────────────────────────────────────────
-
+#[soroban_sdk::contractclient(name = "PriceOracleClient")]
 pub trait PriceOracle {
     fn latest_price(e: Env) -> i128;
 }
 
-soroban_sdk::contractclient!(name = "PriceOracleClient", trait = PriceOracle);
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn sqrt(x: i128) -> i128 {
-    if x == 0 {
-        return 0;
-    }
-    let mut z = (x + 1) / 2;
-    let mut y = x;
-    while z < y {
-        y = z;
-        z = (x / z + z) / 2;
-    }
-    y
-}
-
-/// Load PoolState; returns Err(NotInitialized) when absent.
-fn load_pool(e: &Env) -> Result<PoolState, Error> {
-    e.storage()
+fn check_paused(e: &Env) -> Result<(), Error> {
+    let paused: bool = e
+        .storage()
         .instance()
         .get(&DataKey::Pool)
         .ok_or(Error::NotInitialized)
@@ -248,20 +230,22 @@ impl LiquidityPool {
         if e.storage().instance().has(&DataKey::Pool) {
             return Err(Error::AlreadyInitialized);
         }
-        // One write instead of 9 separate writes.
-        save_pool(
-            &e,
-            &PoolState {
-                token_a,
-                token_b,
-                reserve_a: 0,
-                reserve_b: 0,
-                total_shares: 0,
-                fee_bps: DEFAULT_BASE_FEE_BPS,
-                base_fee_bps: DEFAULT_BASE_FEE_BPS,
-                admin,
-                paused: false,
-            },
+        e.storage().instance().set(&DataKey::Admin, &admin);
+        e.storage().instance().set(&DataKey::TokenA, &token_a);
+        e.storage().instance().set(&DataKey::TokenB, &token_b);
+        e.storage().instance().set(&DataKey::ReserveA, &0i128);
+        e.storage().instance().set(&DataKey::ReserveB, &0i128);
+        e.storage().instance().set(&DataKey::TotalShares, &0i128);
+        // Default fee: 30 bps (≈ 0.3%)
+        e.storage()
+            .instance()
+            .set(&DataKey::FeeBasisPoints, &DEFAULT_BASE_FEE_BPS);
+        e.storage()
+            .instance()
+            .set(&DataKey::BaseFeeBasisPoints, &DEFAULT_BASE_FEE_BPS);
+        e.storage().instance().set(
+            &DataKey::FeeUpdateTimelockLedgers,
+            &DEFAULT_FEE_TIMELOCK_LEDGERS,
         );
         Ok(())
     }
@@ -355,12 +339,15 @@ impl LiquidityPool {
         let prev = cfg.last_price;
         cfg.last_price = current_price;
 
-        if prev <= 0 {
-            cfg.last_volatility_bps = 0;
-            // One write instead of 2 writes.
-            e.storage().instance().set(&DataKey::Oracle, &cfg);
-            return Ok(None);
-        }
+        let prev = match previous_price {
+            Some(p) if p > 0 => p,
+            _ => {
+                e.storage()
+                    .instance()
+                    .set(&DataKey::LastVolatilityBps, &0i128);
+                return Ok(None);
+            }
+        };
 
         let price_delta = if current_price >= prev {
             current_price - prev
@@ -394,7 +381,6 @@ impl LiquidityPool {
         e.storage()
             .instance()
             .set(&DataKey::PendingFeeUpdate, &pending);
-
         let scheduled_by = e.current_contract_address();
         e.events().publish(
             (

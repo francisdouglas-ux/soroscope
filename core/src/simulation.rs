@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use stellar_strkey::Strkey;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 use utoipa::ToSchema;
 
 /// Errors that can occur during simulation
@@ -129,13 +130,60 @@ pub struct OptimizationBuffer {
     pub buffer_percentage: f64,
 }
 
-/// Complete optimization report for CPU and RAM
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResourceSearchKind {
+    Cpu,
+    Ram,
+    LedgerRead,
+    LedgerWrite,
+}
+
+impl ResourceSearchKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Ram => "ram",
+            Self::LedgerRead => "ledger_read",
+            Self::LedgerWrite => "ledger_write",
+        }
+    }
+
+    fn estimated_value(self, resources: &SorobanResources) -> u64 {
+        match self {
+            Self::Cpu => resources.cpu_instructions,
+            Self::Ram => resources.ram_bytes,
+            Self::LedgerRead => resources.ledger_read_bytes,
+            Self::LedgerWrite => resources.ledger_write_bytes,
+        }
+    }
+
+    fn observed_value(self, resources: &SorobanResources) -> u64 {
+        self.estimated_value(resources)
+    }
+
+    fn apply_candidate(self, resources: &mut SorobanResources, candidate: u64) {
+        match self {
+            Self::Cpu => resources.cpu_instructions = candidate,
+            // Soroban does not expose a per-transaction RAM cap in the XDR,
+            // so the RAM branch compares the observed RAM usage instead.
+            Self::Ram => {}
+            Self::LedgerRead => resources.ledger_read_bytes = candidate,
+            Self::LedgerWrite => resources.ledger_write_bytes = candidate,
+        }
+    }
+}
+
+/// Complete optimization report for all searchable resource types.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OptimizationReport {
     /// CPU optimization details
     pub cpu: OptimizationBuffer,
     /// RAM optimization details
     pub ram: OptimizationBuffer,
+    /// Ledger read optimization details
+    pub ledger_read: OptimizationBuffer,
+    /// Ledger write optimization details
+    pub ledger_write: OptimizationBuffer,
     /// Recommended limits (including safety margin)
     pub recommended: SorobanResources,
 }
@@ -544,64 +592,193 @@ impl SimulationEngine {
             .simulate_from_contract_id(contract_id, function_name, args.clone(), None, None, None)
             .await?;
         let estimate = initial_result.resources;
+        let contract_id = contract_id.to_string();
+        let function_name = function_name.to_string();
+        let transaction_data = initial_result.transaction_data.clone();
+        let cancellation = CancellationToken::new();
 
-        // 2. Perform binary search for CPU and RAM concurrently
-        let cpu_search = self.binary_search_resource(
-            contract_id,
-            function_name,
-            args.clone(),
-            estimate.cpu_instructions / 2,
-            estimate.cpu_instructions,
-            "cpu",
-            &estimate,
-            &initial_result.transaction_data,
+        let cpu_search = {
+            let engine = self.clone();
+            let contract_id = contract_id.clone();
+            let function_name = function_name.clone();
+            let args = args.clone();
+            let estimate = estimate.clone();
+            let transaction_data = transaction_data.clone();
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move {
+                engine
+                    .binary_search_resource(
+                        &contract_id,
+                        &function_name,
+                        args,
+                        ResourceSearchKind::Cpu,
+                        estimate,
+                        &transaction_data,
+                        cancellation,
+                    )
+                    .await
+            })
+        };
+
+        let ram_search = {
+            let engine = self.clone();
+            let contract_id = contract_id.clone();
+            let function_name = function_name.clone();
+            let args = args.clone();
+            let estimate = estimate.clone();
+            let transaction_data = transaction_data.clone();
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move {
+                engine
+                    .binary_search_resource(
+                        &contract_id,
+                        &function_name,
+                        args,
+                        ResourceSearchKind::Ram,
+                        estimate,
+                        &transaction_data,
+                        cancellation,
+                    )
+                    .await
+            })
+        };
+
+        let ledger_read_search = {
+            let engine = self.clone();
+            let contract_id = contract_id.clone();
+            let function_name = function_name.clone();
+            let args = args.clone();
+            let estimate = estimate.clone();
+            let transaction_data = transaction_data.clone();
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move {
+                engine
+                    .binary_search_resource(
+                        &contract_id,
+                        &function_name,
+                        args,
+                        ResourceSearchKind::LedgerRead,
+                        estimate,
+                        &transaction_data,
+                        cancellation,
+                    )
+                    .await
+            })
+        };
+
+        let ledger_write_search = {
+            let engine = self.clone();
+            let contract_id = contract_id.clone();
+            let function_name = function_name.clone();
+            let args = args.clone();
+            let estimate = estimate.clone();
+            let transaction_data = transaction_data.clone();
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move {
+                engine
+                    .binary_search_resource(
+                        &contract_id,
+                        &function_name,
+                        args,
+                        ResourceSearchKind::LedgerWrite,
+                        estimate,
+                        &transaction_data,
+                        cancellation,
+                    )
+                    .await
+            })
+        };
+
+        let (cpu_search, ram_search, ledger_read_search, ledger_write_search) = tokio::join!(
+            cpu_search,
+            ram_search,
+            ledger_read_search,
+            ledger_write_search
         );
 
-        let ram_search = self.binary_search_resource(
-            contract_id,
-            function_name,
-            args.clone(),
-            estimate.ram_bytes / 2,
-            estimate.ram_bytes,
-            "ram",
-            &estimate,
-            &initial_result.transaction_data,
-        );
+        let cpu_search = Self::resolve_search_result(cpu_search, ResourceSearchKind::Cpu);
+        let ram_search = Self::resolve_search_result(ram_search, ResourceSearchKind::Ram);
+        let ledger_read_search =
+            Self::resolve_search_result(ledger_read_search, ResourceSearchKind::LedgerRead);
+        let ledger_write_search =
+            Self::resolve_search_result(ledger_write_search, ResourceSearchKind::LedgerWrite);
 
-        let (min_cpu, min_ram) = tokio::join!(cpu_search, ram_search);
+        let mut cancelled_error: Option<SimulationError> = None;
 
-        let min_cpu = min_cpu?;
-        let min_ram = min_ram?;
+        let min_cpu = match cpu_search {
+            Ok(value) => value,
+            Err(err) => {
+                if Self::is_cancelled_search_error(&err) {
+                    cancelled_error = Some(err);
+                    0
+                } else {
+                    return Err(err);
+                }
+            }
+        };
+
+        let min_ram = match ram_search {
+            Ok(value) => value,
+            Err(err) => {
+                if Self::is_cancelled_search_error(&err) {
+                    cancelled_error.get_or_insert(err);
+                    0
+                } else {
+                    return Err(err);
+                }
+            }
+        };
+
+        let min_ledger_read = match ledger_read_search {
+            Ok(value) => value,
+            Err(err) => {
+                if Self::is_cancelled_search_error(&err) {
+                    cancelled_error.get_or_insert(err);
+                    0
+                } else {
+                    return Err(err);
+                }
+            }
+        };
+
+        let min_ledger_write = match ledger_write_search {
+            Ok(value) => value,
+            Err(err) => {
+                if Self::is_cancelled_search_error(&err) {
+                    cancelled_error.get_or_insert(err);
+                    0
+                } else {
+                    return Err(err);
+                }
+            }
+        };
+
+        if let Some(err) = cancelled_error {
+            return Err(err);
+        }
 
         // 3. Calculate buffers
-        let cpu_buffer = OptimizationBuffer {
-            estimated: estimate.cpu_instructions,
-            absolute_minimum: min_cpu,
-            buffer_percentage: ((estimate.cpu_instructions as f64 - min_cpu as f64)
-                / estimate.cpu_instructions as f64)
-                * 100.0,
-        };
-
-        let ram_buffer = OptimizationBuffer {
-            estimated: estimate.ram_bytes,
-            absolute_minimum: min_ram,
-            buffer_percentage: ((estimate.ram_bytes as f64 - min_ram as f64)
-                / estimate.ram_bytes as f64)
-                * 100.0,
-        };
+        let cpu_buffer = Self::build_optimization_buffer(estimate.cpu_instructions, min_cpu);
+        let ram_buffer = Self::build_optimization_buffer(estimate.ram_bytes, min_ram);
+        let ledger_read_buffer =
+            Self::build_optimization_buffer(estimate.ledger_read_bytes, min_ledger_read);
+        let ledger_write_buffer =
+            Self::build_optimization_buffer(estimate.ledger_write_bytes, min_ledger_write);
 
         // 4. Calculate recommended limits with safety margin
         let recommended = SorobanResources {
             cpu_instructions: (min_cpu as f64 * (1.0 + safety_margin)) as u64,
             ram_bytes: (min_ram as f64 * (1.0 + safety_margin)) as u64,
-            ledger_read_bytes: estimate.ledger_read_bytes,
-            ledger_write_bytes: estimate.ledger_write_bytes,
+            ledger_read_bytes: (min_ledger_read as f64 * (1.0 + safety_margin)) as u64,
+            ledger_write_bytes: (min_ledger_write as f64 * (1.0 + safety_margin)) as u64,
             transaction_size_bytes: estimate.transaction_size_bytes,
         };
 
         Ok(OptimizationReport {
             cpu: cpu_buffer,
             ram: ram_buffer,
+            ledger_read: ledger_read_buffer,
+            ledger_write: ledger_write_buffer,
             recommended,
         })
     }
@@ -612,48 +789,144 @@ impl SimulationEngine {
         contract_id: &str,
         function_name: &str,
         args: Vec<String>,
-        mut low: u64,
-        mut high: u64,
-        resource_type: &str,
-        base_resources: &SorobanResources,
+        resource_type: ResourceSearchKind,
+        base_resources: SorobanResources,
         transaction_data_xdr: &str,
+        cancellation: CancellationToken,
     ) -> Result<u64, SimulationError> {
+        let mut low = 0;
+        let mut high = resource_type.estimated_value(&base_resources);
         let mut min_success = high;
 
         while low <= high {
-            let mid = low + (high - low) / 2;
-            let mut test_resources = base_resources.clone();
-
-            if resource_type == "cpu" {
-                test_resources.cpu_instructions = mid;
-            } else {
-                test_resources.ram_bytes = mid;
+            if cancellation.is_cancelled() {
+                return Err(Self::cancelled_search_error(resource_type));
             }
 
-            match self
-                .simulate_with_exact_limits(
+            let mid = low + (high - low) / 2;
+            let candidate_result = tokio::select! {
+                _ = cancellation.cancelled() => Err(Self::cancelled_search_error(resource_type)),
+                result = self.evaluate_resource_candidate(
                     contract_id,
                     function_name,
                     args.clone(),
-                    &test_resources,
+                    resource_type,
+                    mid,
+                    &base_resources,
                     transaction_data_xdr,
-                )
-                .await
-            {
-                Ok(_) => {
+                ) => result,
+            };
+
+            match candidate_result {
+                Ok(true) => {
                     min_success = mid;
                     if mid == 0 {
                         break;
                     }
                     high = mid - 1;
                 }
-                Err(_) => {
+                Ok(false) => {
                     low = mid + 1;
+                }
+                Err(err) => {
+                    cancellation.cancel();
+                    return Err(err);
                 }
             }
         }
 
         Ok(min_success)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn evaluate_resource_candidate(
+        &self,
+        contract_id: &str,
+        function_name: &str,
+        args: Vec<String>,
+        resource_type: ResourceSearchKind,
+        candidate: u64,
+        base_resources: &SorobanResources,
+        transaction_data_xdr: &str,
+    ) -> Result<bool, SimulationError> {
+        let mut test_resources = base_resources.clone();
+        resource_type.apply_candidate(&mut test_resources, candidate);
+
+        match self
+            .simulate_with_exact_limits(
+                contract_id,
+                function_name,
+                args,
+                &test_resources,
+                transaction_data_xdr,
+            )
+            .await
+        {
+            Ok(result) => Ok(resource_type.observed_value(&result.resources) <= candidate),
+            Err(err) if Self::is_significant_search_failure(&err) => Err(err),
+            Err(_) => Ok(false),
+        }
+    }
+
+    fn build_optimization_buffer(estimated: u64, absolute_minimum: u64) -> OptimizationBuffer {
+        let buffer_percentage = if estimated == 0 {
+            0.0
+        } else {
+            ((estimated as f64 - absolute_minimum as f64) / estimated as f64) * 100.0
+        };
+
+        OptimizationBuffer {
+            estimated,
+            absolute_minimum,
+            buffer_percentage,
+        }
+    }
+
+    fn resolve_search_result(
+        result: Result<Result<u64, SimulationError>, tokio::task::JoinError>,
+        resource_type: ResourceSearchKind,
+    ) -> Result<u64, SimulationError> {
+        match result {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(err)) => Err(err),
+            Err(err) => Err(SimulationError::RpcRequestFailed(format!(
+                "{} optimization task failed: {}",
+                resource_type.label(),
+                err
+            ))),
+        }
+    }
+
+    fn cancelled_search_error(resource_type: ResourceSearchKind) -> SimulationError {
+        SimulationError::RpcRequestFailed(format!(
+            "Optimization search cancelled while {} search was running",
+            resource_type.label()
+        ))
+    }
+
+    fn is_cancelled_search_error(err: &SimulationError) -> bool {
+        matches!(
+            err,
+            SimulationError::RpcRequestFailed(msg)
+                if msg.starts_with("Optimization search cancelled")
+        )
+    }
+
+    fn is_significant_search_failure(err: &SimulationError) -> bool {
+        match err {
+            SimulationError::NodeTimeout | SimulationError::NetworkError(_) => true,
+            SimulationError::RpcRequestFailed(msg) => {
+                msg.starts_with("HTTP error:")
+                    || msg.starts_with("Network error:")
+                    || msg.starts_with("Failed to parse response:")
+                    || msg.starts_with("Internal error:")
+                    || msg.starts_with("Method not found")
+                    || msg.starts_with("All RPC providers")
+                    || msg.starts_with("All providers exhausted")
+                    || msg.starts_with("Optimization search cancelled")
+            }
+            _ => false,
+        }
     }
 
     async fn simulate_with_exact_limits(
@@ -674,7 +947,11 @@ impl SimulationEngine {
             })?;
 
         // 2. Update the resource limits in the transaction data
-        soroban_data.resources.instructions = resources.cpu_instructions as u32;
+        soroban_data.resources.instructions =
+            resources.cpu_instructions.min(u32::MAX as u64) as u32;
+        soroban_data.resources.read_bytes = resources.ledger_read_bytes.min(u32::MAX as u64) as u32;
+        soroban_data.resources.write_bytes =
+            resources.ledger_write_bytes.min(u32::MAX as u64) as u32;
 
         // 3. Create the basic host function
         let contract_hash = self.parse_contract_id(contract_id)?;
@@ -2209,7 +2486,10 @@ impl SimulationCache {
         let hits = l1_hits + l2_hits;
         let misses = self.misses.load(Ordering::Relaxed);
         let total = hits + misses;
-        let hit_rate_pct = if total > 0 { hits * 100 / total } else { 0 };
+        let hit_rate_pct = hits
+            .checked_mul(100)
+            .and_then(|value| value.checked_div(total))
+            .unwrap_or(0);
         tracing::info!(
             cache.l1_hits = l1_hits,
             cache.l2_hits = l2_hits,
@@ -2268,6 +2548,81 @@ mod tests {
         assert!(json.contains("\"ledger_write_bytes\":256"));
         let deserialized: SorobanResources = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, resources);
+    }
+
+    #[test]
+    fn test_resource_search_kind_reads_expected_fields() {
+        let resources = SorobanResources {
+            cpu_instructions: 1_000_000,
+            ram_bytes: 2_048,
+            ledger_read_bytes: 512,
+            ledger_write_bytes: 256,
+            transaction_size_bytes: 128,
+        };
+
+        assert_eq!(
+            ResourceSearchKind::Cpu.observed_value(&resources),
+            1_000_000
+        );
+        assert_eq!(ResourceSearchKind::Ram.observed_value(&resources), 2_048);
+        assert_eq!(
+            ResourceSearchKind::LedgerRead.observed_value(&resources),
+            512
+        );
+        assert_eq!(
+            ResourceSearchKind::LedgerWrite.observed_value(&resources),
+            256
+        );
+    }
+
+    #[test]
+    fn test_resource_search_kind_applies_exact_limits_where_supported() {
+        let mut resources = SorobanResources {
+            cpu_instructions: 1_000,
+            ram_bytes: 2_000,
+            ledger_read_bytes: 300,
+            ledger_write_bytes: 400,
+            transaction_size_bytes: 128,
+        };
+
+        ResourceSearchKind::Cpu.apply_candidate(&mut resources, 10);
+        ResourceSearchKind::Ram.apply_candidate(&mut resources, 20);
+        ResourceSearchKind::LedgerRead.apply_candidate(&mut resources, 30);
+        ResourceSearchKind::LedgerWrite.apply_candidate(&mut resources, 40);
+
+        assert_eq!(resources.cpu_instructions, 10);
+        assert_eq!(resources.ram_bytes, 2_000);
+        assert_eq!(resources.ledger_read_bytes, 30);
+        assert_eq!(resources.ledger_write_bytes, 40);
+    }
+
+    #[test]
+    fn test_build_optimization_buffer_handles_zero_estimate() {
+        let buffer = SimulationEngine::build_optimization_buffer(0, 0);
+        assert_eq!(buffer.estimated, 0);
+        assert_eq!(buffer.absolute_minimum, 0);
+        assert_eq!(buffer.buffer_percentage, 0.0);
+    }
+
+    #[test]
+    fn test_significant_search_failure_detection() {
+        assert!(SimulationEngine::is_significant_search_failure(
+            &SimulationError::NodeTimeout
+        ));
+        assert!(SimulationEngine::is_significant_search_failure(
+            &SimulationError::RpcRequestFailed("HTTP error: 503 Service Unavailable".to_string())
+        ));
+        assert!(SimulationEngine::is_significant_search_failure(
+            &SimulationError::RpcRequestFailed("All providers exhausted".to_string())
+        ));
+        assert!(!SimulationEngine::is_significant_search_failure(
+            &SimulationError::NodeError("resource limit exceeded".to_string())
+        ));
+        assert!(!SimulationEngine::is_significant_search_failure(
+            &SimulationError::RpcRequestFailed(
+                "RPC error -32000: tx resource limit exceeded".to_string()
+            )
+        ));
     }
 
     #[test]

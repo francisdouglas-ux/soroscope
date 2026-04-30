@@ -1,6 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, xdr::ToXdr, Address, BytesN, Env, String};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, crypto::Signature, Address, Bytes, BytesN, Env, String,
+};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -47,6 +49,8 @@ impl TypedDataAuth {
         let _signature = signature;
 
         signer.require_auth();
+
+        // Log the successful authorization (optional)
         env.events().publish(
             ("transfer_authorized",),
             (signer, transfer.from, transfer.to, transfer.amount),
@@ -55,24 +59,40 @@ impl TypedDataAuth {
 
     /// Computes the domain separator hash.
     fn domain_separator_hash(env: &Env, domain: &Domain) -> BytesN<32> {
-        env.crypto()
-            .sha256(
-                &(
-                    domain.name.clone(),
-                    domain.version.clone(),
-                    domain.chain_id,
-                    domain.verifying_contract.clone(),
-                )
-                    .to_xdr(env),
-            )
-            .into()
+        let type_hash = env.crypto().sha256(&env.bytes(
+            b"EIP712Domain(string name,string version,u32 chainId,Address verifyingContract)",
+        ));
+        let name_hash = env.crypto().sha256(&env.bytes(domain.name.as_bytes()));
+        let version_hash = env.crypto().sha256(&env.bytes(domain.version.as_bytes()));
+        let chain_id_bytes = domain.chain_id.to_be_bytes();
+        let verifying_contract_bytes = domain.verifying_contract.to_string().as_bytes();
+
+        let mut data = Bytes::new(env);
+        data.extend_from_slice(&type_hash);
+        data.extend_from_slice(&name_hash);
+        data.extend_from_slice(&version_hash);
+        data.extend_from_slice(&chain_id_bytes);
+        data.extend_from_slice(&verifying_contract_bytes);
+
+        env.crypto().sha256(&data)
     }
 
     /// Computes the struct hash for Transfer.
     fn struct_hash(env: &Env, transfer: &Transfer) -> BytesN<32> {
-        env.crypto()
-            .sha256(&(transfer.from.clone(), transfer.to.clone(), transfer.amount).to_xdr(env))
-            .into()
+        let type_hash = env
+            .crypto()
+            .sha256(&env.bytes(b"Transfer(address from,address to,int128 amount)"));
+        let from_bytes = transfer.from.to_string().as_bytes();
+        let to_bytes = transfer.to.to_string().as_bytes();
+        let amount_bytes = transfer.amount.to_be_bytes();
+
+        let mut data = Bytes::new(env);
+        data.extend_from_slice(&type_hash);
+        data.extend_from_slice(&from_bytes);
+        data.extend_from_slice(&to_bytes);
+        data.extend_from_slice(&amount_bytes);
+
+        env.crypto().sha256(&data)
     }
 
     /// Computes the final message hash.

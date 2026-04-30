@@ -206,13 +206,13 @@ pub struct Math;
 
 #[contractimpl]
 impl Math {
-    pub fn exp(_e: Env, x: i128) -> Result<i128, MathError> {
+    pub fn exp(_env: Env, x: i128) -> Result<i128, MathError> {
         Fixed(x).exp().map(|f| f.0)
     }
-    pub fn ln(_e: Env, x: i128) -> Result<i128, MathError> {
+    pub fn ln(_env: Env, x: i128) -> Result<i128, MathError> {
         Fixed(x).ln().map(|f| f.0)
     }
-    pub fn pow(_e: Env, x: i128, y: i128) -> Result<i128, MathError> {
+    pub fn pow(_env: Env, x: i128, y: i128) -> Result<i128, MathError> {
         Fixed(x).pow(Fixed(y)).map(|f| f.0)
     }
 }

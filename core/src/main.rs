@@ -510,6 +510,8 @@ fn default_safety_margin() -> f64 {
 pub struct OptimizeLimitsResponse {
     pub cpu: crate::simulation::OptimizationBuffer,
     pub ram: crate::simulation::OptimizationBuffer,
+    pub ledger_read: crate::simulation::OptimizationBuffer,
+    pub ledger_write: crate::simulation::OptimizationBuffer,
     pub recommended: crate::simulation::SorobanResources,
 }
 
@@ -923,6 +925,8 @@ async fn optimize_limits(
     Ok(Json(OptimizeLimitsResponse {
         cpu: report.cpu,
         ram: report.ram,
+        ledger_read: report.ledger_read,
+        ledger_write: report.ledger_write,
         recommended: report.recommended,
     }))
 }
