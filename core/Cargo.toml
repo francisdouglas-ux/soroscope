@@ -36,3 +36,4 @@ sqlx = { version = "0.7", features = ["runtime-tokio", "tls-native-tls", "postgr
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+rsa = "0.9"
