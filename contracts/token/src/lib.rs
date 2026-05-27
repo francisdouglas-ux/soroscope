@@ -9,6 +9,8 @@ mod storage_types;
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod test_admin_rotation;
 
 pub use crate::contract::Token;
 pub use crate::contract::TokenClient;
