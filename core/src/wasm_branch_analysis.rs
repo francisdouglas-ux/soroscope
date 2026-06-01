@@ -423,11 +423,7 @@ fn scan_function_body(body: &[u8]) -> ScanAccumulator {
                     branch_id,
                     branch_type: BranchType::BranchTable,
                     nesting_depth: depth,
-                    description: format!(
-                        "br_table ({} targets) at depth {}",
-                        n + 1,
-                        depth
-                    ),
+                    description: format!("br_table ({} targets) at depth {}", n + 1, depth),
                 });
                 acc.breakdown.branch_tables += 1;
                 branch_id += 1;
@@ -659,8 +655,13 @@ pub fn analyze_wasm_branches(
     };
 
     // ── 2. Baseline simulation ────────────────────────────────────────────────
-    let baseline_resources =
-        profile_contract(wasm_bytes.clone(), function_name.clone(), args.clone())?;
+    let baseline_resources = profile_contract(
+        wasm_bytes.clone(),
+        function_name.clone(),
+        args.clone(),
+        None,
+        None,
+    )?;
 
     // ── 3. Multi-path dynamic exploration ────────────────────────────────────
     let variations = generate_arg_variations(&args);
@@ -681,6 +682,8 @@ pub fn analyze_wasm_branches(
                 wasm_bytes.clone(),
                 function_name.clone(),
                 variant_args.clone(),
+                None,
+                None,
             )
         }));
 
@@ -958,7 +961,10 @@ mod tests {
 
         let acc = scan_function_body(&body);
         assert_eq!(acc.breakdown.conditionals, 1);
-        assert!(acc.branches.iter().any(|b| b.branch_type == BranchType::Conditional));
+        assert!(acc
+            .branches
+            .iter()
+            .any(|b| b.branch_type == BranchType::Conditional));
     }
 
     #[test]
@@ -1114,7 +1120,11 @@ mod tests {
         let wasm = minimal_wasm_with_body("noop", &[]);
         let body = extract_function_body(&wasm, "noop").expect("body must be found");
         let acc = scan_function_body(body);
-        assert_eq!(acc.branches.len(), 0, "empty function should have zero branches");
+        assert_eq!(
+            acc.branches.len(),
+            0,
+            "empty function should have zero branches"
+        );
     }
 
     #[test]
@@ -1130,7 +1140,10 @@ mod tests {
         let acc = scan_function_body(body);
 
         assert_eq!(acc.breakdown.conditionals, 1, "should detect the if block");
-        assert_eq!(acc.breakdown.early_returns, 1, "should detect the early return");
+        assert_eq!(
+            acc.breakdown.early_returns, 1,
+            "should detect the early return"
+        );
         assert!(acc.max_depth >= 1);
     }
 }

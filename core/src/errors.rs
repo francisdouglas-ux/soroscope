@@ -23,6 +23,12 @@ pub enum AppError {
 
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
+
+    #[error("Service unavailable: {0}")]
+    ServiceUnavailable(String),
+
+    #[error("Conflict: {0}")]
+    Conflict(String),
 }
 
 #[derive(Serialize, ToSchema)]
@@ -42,6 +48,8 @@ impl AppError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Conflict(_) => StatusCode::CONFLICT,
         }
     }
 
@@ -51,6 +59,8 @@ impl AppError {
             Self::NotFound(_) => "NOT_FOUND",
             Self::BadRequest(_) => "BAD_REQUEST",
             Self::Unauthorized(_) => "UNAUTHORIZED",
+            Self::ServiceUnavailable(_) => "SERVICE_UNAVAILABLE",
+            Self::Conflict(_) => "CONFLICT",
         }
     }
 }
@@ -108,8 +118,14 @@ impl From<SimulationError> for AppError {
             SimulationError::LocalUnavailable => AppError::Internal(
                 "Local WASM execution unavailable and no RPC fallback succeeded".to_string(),
             ),
-            SimulationError::ExecutionFailed(msg) => {
-                AppError::BadRequest(format!("Contract execution failed: {}", msg))
+            SimulationError::ExecutionFailed(e) => {
+                AppError::Internal(format!("Execution failed: {e}"))
+            }
+            SimulationError::InsufficientConsensusProviders(needed) => {
+                AppError::ServiceUnavailable(format!("Insufficient providers for consensus: needed {needed}"))
+            }
+            SimulationError::ConsensusMismatch(e) => {
+                AppError::Conflict(format!("Consensus mismatch: {e}"))
             }
         }
     }

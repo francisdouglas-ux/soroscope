@@ -26,6 +26,7 @@ const PEER_FAILURE_PENALTY: i64 = 20;
 const MIN_PROVIDER_SCORE: i64 = 25;
 const MAX_GOSSIP_PROVIDERS: usize = 64;
 const MAX_GOSSIP_PEERS: usize = 64;
+const MIN_SAMPLES_FOR_EMA: u64 = 10;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RpcProvider {
@@ -103,6 +104,55 @@ pub struct RegistrySnapshot {
     pub providers: Vec<GossipProviderSnapshot>,
 }
 
+#[derive(Debug)]
+struct ProviderStats {
+    window_size: u64,
+    ema_rtt_us: AtomicU64,
+    sample_count: AtomicU64,
+}
+
+impl ProviderStats {
+    fn new(window_size: u64) -> Self {
+        Self {
+            window_size: window_size.max(1),
+            ema_rtt_us: AtomicU64::new(0),
+            sample_count: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, rtt_us: u64) {
+        let count = self.sample_count.fetch_add(1, Ordering::Relaxed);
+        if count == 0 {
+            self.ema_rtt_us.store(rtt_us, Ordering::Relaxed);
+        } else {
+            let alpha = 2.0 / (self.window_size as f64 + 1.0);
+            let prev_ema = self.ema_rtt_us.load(Ordering::Relaxed) as f64;
+            let next_ema = (rtt_us as f64 * alpha) + (prev_ema * (1.0 - alpha));
+            self.ema_rtt_us.store(next_ema as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn ema_rtt_us(&self) -> u64 {
+        self.ema_rtt_us.load(Ordering::Relaxed)
+    }
+
+    fn sample_count(&self) -> u64 {
+        self.sample_count.load(Ordering::Relaxed)
+    }
+
+    fn is_warmed(&self) -> bool {
+        self.sample_count() >= MIN_SAMPLES_FOR_EMA
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderStatsSnapshot {
+    pub url: String,
+    pub ema_rtt_us: u64,
+    pub sample_count: u64,
+    pub is_warmed: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderHealthReport {
     pub name: String,
@@ -148,6 +198,7 @@ struct ProviderState {
     latest_ledger: AtomicU64,
     last_local_observed_at: RwLock<Option<DateTime<Utc>>>,
     remote_observations: RwLock<HashMap<String, RemoteProviderObservation>>,
+    stats: ProviderStats,
 }
 
 impl ProviderState {
@@ -161,6 +212,7 @@ impl ProviderState {
             latest_ledger: AtomicU64::new(0),
             last_local_observed_at: RwLock::new(None),
             remote_observations: RwLock::new(HashMap::new()),
+            stats: ProviderStats::new(20), // 20-sample EMA window
         }
     }
 }
@@ -244,12 +296,146 @@ impl ProviderRegistry {
     /// in priority order (skipping tripped providers whose cooldown hasn't elapsed).
     pub async fn healthy_providers(&self) -> Vec<RpcProvider> {
         let mut available = Vec::new();
-        for state in &self.states {
+        let states = self.states.read().await;
+        for state in states.values() {
             if self.is_available(state).await {
-                available.push(state.provider.clone());
+                let provider = state.provider.read().await;
+                available.push(provider.clone());
             }
         }
         available
+    }
+
+    pub async fn is_available(&self, state: &Arc<ProviderState>) -> bool {
+        !self.is_provider_tripped(state).await
+    }
+
+    pub async fn registry_snapshot(&self) -> RegistrySnapshot {
+        let states = self.states.read().await;
+        let mut providers = Vec::with_capacity(states.len());
+        for state in states.values() {
+            let provider = state.provider.read().await;
+            if provider.should_advertise() {
+                providers.push(GossipProviderSnapshot {
+                    provider: provider.public_provider(),
+                    score: state.local_score.load(Ordering::Relaxed),
+                    latest_ledger: Some(state.latest_ledger.load(Ordering::Relaxed)),
+                    consecutive_failures: state.consecutive_failures.load(Ordering::Relaxed),
+                    healthy: self.is_available(state).await,
+                    observed_at: Utc::now(),
+                });
+            }
+        }
+
+        let peers_map = self.peers.read().await;
+        let mut peers = Vec::with_capacity(peers_map.len());
+        for (url, state) in peers_map.iter() {
+            peers.push(PeerAdvertisement {
+                instance_id: state.instance_id.read().await.clone(),
+                base_url: url.clone(),
+            });
+        }
+
+        RegistrySnapshot {
+            instance_id: self.instance_id.clone(),
+            base_url: self.public_base_url.clone(),
+            generated_at: Utc::now(),
+            peers,
+            providers,
+        }
+    }
+
+    pub async fn merge_snapshot(&self, snapshot: RegistrySnapshot) {
+        if let Some(ref base_url) = snapshot.base_url {
+            self.register_peer(base_url, Some(snapshot.instance_id.clone()), None)
+                .await;
+        }
+
+        for peer in snapshot.peers {
+            self.register_peer(
+                &peer.base_url,
+                peer.instance_id,
+                snapshot.base_url.as_deref(),
+            )
+            .await;
+        }
+
+        for provider_snap in snapshot.providers {
+            let provider = RpcProvider {
+                name: provider_snap.provider.name,
+                url: provider_snap.provider.url,
+                auth_header: None,
+                auth_value: None,
+                advertise: None,
+            };
+            let state = self
+                .get_or_insert_provider(provider, "gossip", PEER_STARTING_SCORE)
+                .await;
+
+            let mut remote_obs = state.remote_observations.write().await;
+            remote_obs.insert(
+                snapshot.instance_id.clone(),
+                RemoteProviderObservation {
+                    score: provider_snap.score,
+                    latest_ledger: provider_snap.latest_ledger.unwrap_or(0),
+                    consecutive_failures: provider_snap.consecutive_failures,
+                    healthy: provider_snap.healthy,
+                    observed_at: provider_snap.observed_at,
+                },
+            );
+        }
+    }
+
+    pub async fn peer_reports(&self) -> Vec<PeerHealthReport> {
+        let peers = self.peers.read().await;
+        let mut reports = Vec::with_capacity(peers.len());
+        for state in peers.values() {
+            reports.push(self.build_peer_report(Arc::clone(state)).await);
+        }
+        reports
+    }
+
+    pub fn record_rtt(&self, url: &str, rtt_us: u64) {
+        if let Some(state) = self.states.blocking_read().get(url) {
+            state.stats.record(rtt_us);
+        }
+    }
+
+    pub async fn providers_by_latency(&self) -> Vec<RpcProvider> {
+        let healthy = self.healthy_providers().await;
+        if healthy.is_empty() {
+            return Vec::new();
+        }
+
+        let states = self.states.read().await;
+        let mut with_stats = Vec::new();
+        for provider in healthy {
+            if let Some(state) = states.get(&provider.url) {
+                with_stats.push((provider, state.stats.ema_rtt_us(), state.stats.is_warmed()));
+            }
+        }
+        drop(states);
+
+        // Sort by EMA RTT if warmed, otherwise use a stable order or round-robin
+        // For now, just sort by RTT
+        with_stats.sort_by_key(|(_, rtt, _)| *rtt);
+        with_stats.into_iter().map(|(p, _, _)| p).collect()
+    }
+
+    pub fn stats_snapshot(&self) -> Vec<ProviderStatsSnapshot> {
+        let states = self.states.blocking_read();
+        states
+            .values()
+            .map(|state| {
+                let provider = state.provider.blocking_read();
+                ProviderStatsSnapshot {
+                    url: provider.url.clone(),
+                    ema_rtt_us: state.stats.ema_rtt_us(),
+                    sample_count: state.stats.sample_count(),
+                    is_warmed: state.stats.is_warmed(),
+                }
+            })
+            .collect()
     }
 
     pub async fn report_success(&self, url: &str) {
@@ -906,9 +1092,17 @@ mod tests {
         for _ in 0..MIN_SAMPLES_FOR_EMA - 1 {
             stats.record(100);
         }
-        assert!(!stats.is_warmed(), "{} samples is below threshold", stats.sample_count());
+        assert!(
+            !stats.is_warmed(),
+            "{} samples is below threshold",
+            stats.sample_count()
+        );
         stats.record(100);
-        assert!(stats.is_warmed(), "{} samples should be warmed", stats.sample_count());
+        assert!(
+            stats.is_warmed(),
+            "{} samples should be warmed",
+            stats.sample_count()
+        );
     }
 
     #[tokio::test]

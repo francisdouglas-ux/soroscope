@@ -44,6 +44,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 rsa = "0.9"
+tokio-util = { version = "0.7", features = ["full"] }
+wasmparser = "0.121"
+wasm-encoder = "0.38"
 
 [dev-dependencies]
 proptest = "1.4.0"
